@@ -373,6 +373,13 @@ class OQManager:
         """Return all tasks as serializable dicts."""
         return [t.to_dict() for t in self._tasks.values()]
 
+    @property
+    def is_quantizing(self) -> bool:
+        """Check if any quantization task is actively running."""
+        return any(
+            t.status in _ACTIVE_STATUSES for t in self._tasks.values()
+        )
+
     async def shutdown(self) -> None:
         """Cancel all active tasks."""
         for task_id in list(self._active_tasks):
