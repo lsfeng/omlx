@@ -10,7 +10,7 @@ streaming or chat completion.
 import asyncio
 import gc
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 
@@ -39,6 +39,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         Args:
             model_name: HuggingFace model name or local path
         """
+        super().__init__()
         self._model_name = model_name
         self._model: Optional[MLXEmbeddingModel] = None
 
@@ -89,7 +90,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
     async def embed(
         self,
-        texts: List[str],
+        texts: Union[List[str], List[Dict[str, str]]],
         max_length: int = 512,
         padding: bool = True,
         truncation: bool = True,
@@ -113,14 +114,20 @@ class EmbeddingEngine(BaseNonStreamingEngine):
 
         def _embed_sync():
             return model.embed(
-                texts=texts,
+                inputs=texts,
                 max_length=max_length,
                 padding=padding,
                 truncation=truncation,
             )
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+        with self._active_lock:
+            self._active_count += 1
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+        finally:
+            with self._active_lock:
+                self._active_count -= 1
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

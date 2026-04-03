@@ -15,11 +15,15 @@ except ImportError:
 
 from omlx.oq import (
     OQ_LEVELS,
+    _LEVEL_BITS,
+    _OQ_BPW_TARGETS,
+    _bpw_targets_for_level,
+    _build_quant_plan,
     _extract_layer_index,
     _format_size,
     _get_predicate_bits,
     _is_moe_router,
-    _search_best_clip,
+    _normalize_quant_path,
     _should_quantize_tensor,
     estimate_memory,
     make_predicate,
@@ -63,11 +67,13 @@ class TestUniversalQuantPredicate:
 
     # Stage 0: Non-quantization (should return False)
 
-    def test_moe_router_not_quantized(self, moe_config, module):
-        assert universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config) is False
+    def test_moe_router_fp16(self, moe_config, module):
+        result = universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config)
+        assert result is False  # MoE router gates kept fp16 (some models lack to_quantized)
 
-    def test_shared_expert_gate_not_quantized(self, moe_config, module):
-        assert universal_quant_predicate("model.layers.0.shared_expert_gate", module, moe_config) is False
+    def test_shared_expert_gate_8bit(self, moe_config, module):
+        result = universal_quant_predicate("model.layers.0.shared_expert_gate", module, moe_config)
+        assert isinstance(result, dict) and result["bits"] == 8
 
     def test_vision_encoder_not_quantized(self, dense_config, module):
         assert universal_quant_predicate("visual.encoder.layers.0.self_attn.q_proj", module, dense_config) is False
@@ -199,9 +205,9 @@ class TestUniversalQuantPredicate:
 
     # Group size
 
-    def test_moe_router_group_size_not_applicable(self, moe_config, module):
-        # Router returns False, so group_size is not relevant
-        assert universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config) is False
+    def test_moe_router_fp16_group_size(self, moe_config, module):
+        result = universal_quant_predicate("model.layers.0.mlp.gate", module, moe_config)
+        assert result is False  # MoE router gates kept fp16
 
     def test_150_expert_group_size_128(self, module):
         config = {"num_hidden_layers": 32, "num_local_experts": 200, "hidden_size": 2048}
@@ -212,6 +218,54 @@ class TestUniversalQuantPredicate:
         # group_size should be 128 for 150+ experts
         # gate_proj is in stage 6, returns True, so no dict to check
         assert result is True
+
+    # VLM nested config support
+
+    def test_vlm_nested_config_moe_detection(self, module):
+        """VLM models have text model config nested under text_config."""
+        vlm_config = {
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "num_hidden_layers": 40,
+                "num_experts": 256,
+                "hidden_size": 2048,
+            },
+            "vision_config": {"hidden_size": 1152},
+        }
+        # Expert down_proj should be base bits (routed expert in MoE)
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.experts.0.down_proj", module, vlm_config
+        )
+        assert result is True  # base bits, NOT 5-bit
+
+    def test_vlm_nested_config_sensitive_layers(self, module):
+        """Sensitive layer calculation uses correct num_hidden_layers from text_config."""
+        vlm_config = {
+            "text_config": {
+                "num_hidden_layers": 40,
+                "num_experts": 256,
+                "hidden_size": 2048,
+            },
+        }
+        # Layer 10 should NOT be sensitive (40 layers: first 5 and last 5)
+        result = universal_quant_predicate(
+            "model.layers.10.self_attn.v_proj", module, vlm_config
+        )
+        assert result is True  # base bits (not sensitive)
+
+    def test_vlm_nested_config_num_local_experts(self, module):
+        """Also handles num_local_experts in text_config."""
+        vlm_config = {
+            "text_config": {
+                "num_hidden_layers": 32,
+                "num_local_experts": 64,
+                "hidden_size": 4096,
+            },
+        }
+        result = universal_quant_predicate(
+            "model.layers.10.mlp.experts.0.down_proj", module, vlm_config
+        )
+        assert result is True  # routed expert → base bits
 
 
 # =============================================================================
@@ -241,6 +295,14 @@ class TestHelpers:
     def test_extract_layer_index_large(self):
         assert _extract_layer_index("model.layers.47.mlp.gate_proj") == 47
 
+    def test_normalize_quant_path_weight(self):
+        assert _normalize_quant_path("model.layers.0.self_attn.q_proj.weight") == (
+            "model.layers.0.self_attn.q_proj"
+        )
+
+    def test_normalize_quant_path_scales(self):
+        assert _normalize_quant_path("lm_head.scales") == "lm_head"
+
 
 # =============================================================================
 # Test resolve_output_name
@@ -257,21 +319,13 @@ class TestResolveOutputName:
     def test_strip_existing_oq_suffix(self):
         assert resolve_output_name("Qwen3.5-122B-A10B-oQ6", 2) == "Qwen3.5-122B-A10B-oQ2"
 
-    def test_clip_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B", 4, enable_clip=True) == "Qwen3.5-122B-A10B-oQ4+"
-
-    def test_strip_existing_clip_suffix(self):
-        assert resolve_output_name("Qwen3.5-122B-A10B-oQ4+", 2) == "Qwen3.5-122B-A10B-oQ2"
+    def test_strip_existing_enhanced_suffix(self):
+        assert resolve_output_name("Qwen3.5-122B-A10B-oQ4e", 2) == "Qwen3.5-122B-A10B-oQ2"
 
     def test_all_levels(self):
         for level in OQ_LEVELS:
             result = resolve_output_name("Model-7B", level)
             assert result == f"Model-7B-oQ{level}"
-
-    def test_all_levels_clip(self):
-        for level in OQ_LEVELS:
-            result = resolve_output_name("Model-7B", level, enable_clip=True)
-            assert result == f"Model-7B-oQ{level}+"
 
 
 # =============================================================================
@@ -289,75 +343,18 @@ class TestValidateQuantizable:
     def test_quantization_config(self):
         assert validate_quantizable({"quantization_config": {"bits": 4}}) is False
 
+    def test_fp8_native_is_quantizable(self):
+        # Native FP8 models (MiniMax, DeepSeek) should be quantizable
+        assert validate_quantizable({"quantization_config": {"quant_method": "fp8"}}) is True
+
+    def test_non_fp8_quantization_config(self):
+        # Other quant methods (gptq, awq) are already quantized
+        assert validate_quantizable({"quantization_config": {"quant_method": "gptq"}}) is False
+
 
 # =============================================================================
 # Test make_predicate
 # =============================================================================
-
-
-@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-class TestClipOptimization:
-    """Test AWQ-style output-MSE clip optimization."""
-
-    def test_search_best_clip_returns_same_shape(self):
-        """Clipped weights should have the same shape as input."""
-
-        w = mx.random.normal((64, 128))
-        x = mx.random.normal((32, 128))  # 32 activation samples
-        clipped = _search_best_clip(w, x, group_size=64, bits=4)
-        assert clipped.shape == w.shape
-
-    def test_search_best_clip_reduces_range(self):
-        """Clipping should reduce the weight range (or keep it same)."""
-
-        w = mx.random.normal((32, 64))
-        x = mx.random.normal((16, 64))
-        clipped = _search_best_clip(w, x, group_size=64, bits=2, n_grid=10)
-        # Clipped range should be <= original range
-        orig_range = float(w.max() - w.min())
-        clip_range = float(clipped.max() - clipped.min())
-        assert clip_range <= orig_range * 1.01
-
-    def test_search_best_clip_2bit(self):
-        """2-bit clip search should work."""
-
-        w = mx.random.normal((16, 128))
-        x = mx.random.normal((8, 128))
-        clipped = _search_best_clip(w, x, group_size=64, bits=2, n_grid=5)
-        assert clipped.shape == w.shape
-        assert clipped.dtype == w.dtype
-
-    def test_output_mse_improves_with_clip(self):
-        """Clipped + quantized should have lower output MSE than raw quantized."""
-
-        np.random.seed(42)
-        # Weight with outliers
-        w_np = np.random.randn(32, 64).astype(np.float32) * 0.1
-        w_np[0, 0] = 5.0
-        w_np[1, 1] = -4.0
-        w = mx.array(w_np)
-        x = mx.random.normal((16, 64))
-
-        # Baseline: quantize directly
-        rtn_q = mx.dequantize(*mx.quantize(w, group_size=64, bits=2), 64, 2)
-        x_grouped = x.reshape(x.shape[0], -1, 64)
-        w_grouped = w.reshape(w.shape[0], -1, 64)
-        rtn_q_grouped = rtn_q.reshape(rtn_q.shape[0], -1, 64)
-        out_orig = mx.einsum("bdg,odg->bod", x_grouped, w_grouped)
-        out_rtn = mx.einsum("bdg,odg->bod", x_grouped, rtn_q_grouped)
-        rtn_loss = float(((out_orig - out_rtn) ** 2).mean())
-
-        # Clip-optimized: search + quantize
-        clipped = _search_best_clip(w, x, group_size=64, bits=2, n_grid=10)
-        clip_q = mx.dequantize(*mx.quantize(clipped, group_size=64, bits=2), 64, 2)
-        clip_q_grouped = clip_q.reshape(clip_q.shape[0], -1, 64)
-        out_clip = mx.einsum("bdg,odg->bod", x_grouped, clip_q_grouped)
-        clip_loss = float(((out_orig - out_clip) ** 2).mean())
-
-        # Clip-optimized should have equal or better output MSE
-        assert clip_loss <= rtn_loss * 1.05, (
-            f"Clip output MSE ({clip_loss:.6f}) worse than RTN ({rtn_loss:.6f})"
-        )
 
 
 class TestMakePredicate:
@@ -374,6 +371,25 @@ class TestMakePredicate:
         assert isinstance(result, dict)
         assert result["bits"] == 6
 
+    @pytest.mark.parametrize("oq_level", [3, 4, 5])
+    def test_budget_plan_disables_static_lm_head_boost_without_override(self, oq_level):
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        pred = make_predicate(config, oq_level=oq_level)
+        module = MagicMock(spec=[])
+        assert pred("lm_head", module) is True
+
+    def test_budget_plan_uses_boost_override(self):
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {"lm_head": {"bits": 6, "group_size": 64, "mode": "affine"}},
+        }
+        pred = make_predicate(config, oq_level=4)
+        module = MagicMock(spec=[])
+        result = pred("lm_head.weight", module)
+        assert isinstance(result, dict)
+        assert result["bits"] == 6
+
 
 # =============================================================================
 # Test estimate_memory
@@ -383,19 +399,13 @@ class TestMakePredicate:
 class TestEstimateMemory:
     def test_streaming_includes_buffer(self):
         size = 100 * 1024**3  # 100GB model
-        result = estimate_memory(size, enable_clip=False)
-        # Streaming: source + 5GB buffer + 5% sanitize overhead
+        result = estimate_memory(size)
+        # Streaming: source + 6GB buffer
         assert result["peak_bytes"] > size
         assert result["peak_bytes"] < size * 1.2
 
-    def test_clip_larger_than_streaming(self):
-        size = 50 * 1024**3
-        streaming = estimate_memory(size, enable_clip=False)
-        clip = estimate_memory(size, enable_clip=True)
-        assert clip["peak_bytes"] > streaming["peak_bytes"]
-
     def test_has_formatted(self):
-        result = estimate_memory(10 * 1024**3, enable_clip=False)
+        result = estimate_memory(10 * 1024**3)
         assert "peak_formatted" in result
         assert "GB" in result["peak_formatted"]
 
@@ -425,34 +435,268 @@ class TestStreamingHelpers:
         # 6-bit → affine (no mxfp mode for 6-bit)
         assert mode == "affine"
 
-    def test_get_predicate_bits_router_skipped(self):
+    def test_get_predicate_bits_router_fp16(self):
         config = {"num_hidden_layers": 32, "num_local_experts": 8}
         bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
-        assert bits is None  # Router → False → no quantization
+        assert bits is None  # Router → fp16 (not quantized)
 
-    def test_get_predicate_bits_default_mxfp4(self):
+    def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}
         bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 4, 64)
         assert bits == 4
-        assert gs == 32  # mxfp4 requires gs=32
-        assert mode == "mxfp4"
-
-    def test_get_predicate_bits_2bit_affine(self):
-        config = {"num_hidden_layers": 32}
-        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 3, 64)
-        # oQ3 → base 2-bit → affine
-        assert bits == 2
+        assert gs == 64
         assert mode == "affine"
 
-    def test_get_predicate_bits_8bit_mxfp8(self):
+    def test_get_predicate_bits_3bit_affine(self):
+        config = {"num_hidden_layers": 32}
+        bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 3, 64)
+        # oQ3 → base 3-bit → affine
+        assert bits == 3
+        assert mode == "affine"
+
+    def test_get_predicate_bits_8bit(self):
         config = {"num_hidden_layers": 32}
         bits, gs, mode = _get_predicate_bits("model.layers.10.mlp.gate_proj.weight", config, 8, 64)
-        # oQ8 → base 8-bit → mxfp8
+        # oQ8 → base 8-bit, always affine mode to minimize kernel combos
         assert bits == 8
-        assert gs == 32
-        assert mode == "mxfp8"
+        assert gs == 64
+        assert mode == "affine"
+
+    def test_build_quant_plan_respects_hard_cap(self):
+        named_shapes = {
+            "lm_head": (4096, 4096),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.self_attn.o_proj": (4096, 4096),
+            "model.layers.1.mlp.down_proj": (4096, 14336),
+            "model.layers.1.mlp.gate_proj": (14336, 4096),
+            "model.layers.1.mlp.up_proj": (14336, 4096),
+        }
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7)
+        assert plan.effective_bpw <= 4.7
+        assert plan.boost_map
 
     def test_format_size(self):
         assert "GB" in _format_size(5 * 1024**3)
         assert "MB" in _format_size(500 * 1024**2)
         assert "KB" in _format_size(500 * 1024)
+
+
+# =============================================================================
+# Test level-specific budget plan
+# =============================================================================
+
+
+class TestLevelBudgetPlan:
+    """Tests for per-level target_bpw and budget plan activation."""
+
+    def test_bpw_targets_for_level_returns_correct_values(self):
+        assert _bpw_targets_for_level(3) == (3.5, 3.7)
+        assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
+        assert _bpw_targets_for_level(4) == (4.6, 4.7)
+        assert _bpw_targets_for_level(5) == (5.5, 5.7)
+        assert _bpw_targets_for_level(6) == (6.5, 6.7)
+
+    def test_bpw_targets_for_level_returns_none_for_minimal(self):
+        assert _bpw_targets_for_level(8) is None
+
+    def test_level_bits_covers_all_oq_levels(self):
+        for level in OQ_LEVELS:
+            assert level in _LEVEL_BITS
+
+    def test_budget_plan_oq2_enabled(self):
+        assert 2 in _OQ_BPW_TARGETS
+        assert _bpw_targets_for_level(2) == (2.8, 3.0)
+
+    def test_budget_plan_oq8_not_enabled(self):
+        assert 8 not in _OQ_BPW_TARGETS
+
+    def test_budget_plan_oq3_respects_cap(self):
+        named_shapes = {
+            "lm_head": (4096, 4096),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.self_attn.o_proj": (4096, 4096),
+            "model.layers.1.mlp.down_proj": (4096, 14336),
+            "model.layers.1.mlp.gate_proj": (14336, 4096),
+            "model.layers.1.mlp.up_proj": (14336, 4096),
+        }
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            named_shapes, config, 3, target_bpw=3.5, hard_cap_bpw=3.7
+        )
+        assert plan.effective_bpw <= 3.7
+
+    @pytest.mark.parametrize(
+        "oq_level,target,cap",
+        [(3, 3.5, 3.7), (4, 4.6, 4.7), (5, 5.5, 5.7)],
+    )
+    def test_budget_plan_respects_level_cap(self, oq_level, target, cap):
+        named_shapes = {
+            "lm_head": (4096, 4096),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.self_attn.o_proj": (4096, 4096),
+            "model.layers.1.mlp.down_proj": (4096, 14336),
+            "model.layers.1.mlp.gate_proj": (14336, 4096),
+            "model.layers.1.mlp.up_proj": (14336, 4096),
+        }
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            named_shapes, config, oq_level,
+            target_bpw=target, hard_cap_bpw=cap,
+        )
+        assert plan.effective_bpw <= cap
+
+    def test_build_quant_plan_mandatory_lm_head(self):
+        # lm_head gets mandatory 8-bit boost (consensus-critical)
+        named_shapes = {"lm_head": (4096, 32000)}
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        config = {"num_hidden_layers": 32, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        assert "lm_head" in plan.boost_map
+        assert plan.boost_map["lm_head"]["bits"] == 8
+
+    def test_build_quant_plan_sensitivity_driven(self):
+        # Sensitive layers get more bits, insensitive get fewer
+        named_shapes = {"lm_head": (4096, 32000)}
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        sensitivity = {"0": 0.05, "1": 0.003, "31": 0.002}
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        # L0 (highest sensitivity) should get boosted
+        l0_boosts = [k for k in plan.boost_map if "layers.0." in k]
+        assert len(l0_boosts) > 0
+        # L0 should get more bits than L1 (if L1 boosted at all)
+        l0_bits = max(plan.boost_map[k]["bits"] for k in l0_boosts)
+        l1_boosts = [k for k in plan.boost_map if "layers.1." in k]
+        if l1_boosts:
+            l1_bits = max(plan.boost_map[k]["bits"] for k in l1_boosts)
+            assert l0_bits >= l1_bits
+
+    def test_build_quant_plan_skips_routed_experts(self):
+        # Routed experts should never be boosted
+        named_shapes = {
+            "lm_head": (4096, 32000),
+            "model.layers.0.self_attn.v_proj": (4096, 4096),
+            "model.layers.0.mlp.switch_mlp.gate_proj": (256, 512, 4096),
+            "model.layers.0.mlp.switch_mlp.up_proj": (256, 512, 4096),
+        }
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.05},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
+        )
+        for k in plan.boost_map:
+            assert "switch_mlp" not in k
+
+    def test_oq2_budget_plan_respects_cap(self):
+        """oQ2 with budget plan should stay within hard cap."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        sensitivity = {str(i): 0.1 / (i + 1) for i in range(32)}
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
+        )
+        assert plan.effective_bpw <= 3.0
+        assert plan.boost_map
+
+    def test_oq2_moe_protection_floor(self):
+        """oQ2 MoE: protection floor boosts attention, experts stay 2bit."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        n_layers = 52
+        n_experts = 64
+        for i in range(n_layers):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (1024, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.k_proj"] = (1024, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.o_proj"] = (4096, 1024)
+        for i in range(n_layers):
+            for e in range(n_experts):
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.down_proj"] = (4096, 1024)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.up_proj"] = (1024, 4096)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.gate_proj"] = (1024, 4096)
+        sensitivity = {str(i): 0.1 / (i + 1) for i in range(n_layers)}
+        config = {
+            "num_hidden_layers": n_layers,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
+        )
+        assert plan.effective_bpw <= 3.0
+        # Attention tensors should be boosted via protection floor
+        attn_boosts = [k for k in plan.boost_map if "self_attn" in k]
+        assert len(attn_boosts) > 0, "Expected attention protection floor boosts"
+        # Routed experts should NOT be boosted
+        expert_boosts = [k for k in plan.boost_map if "experts" in k]
+        assert len(expert_boosts) == 0, "Routed experts should stay at base bits"
+
+    def test_oq2_moe_protection_floor_switch_mlp(self):
+        """oQ2 MoE with switch_mlp naming: experts stay 2bit, attention boosted."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        n_layers = 52
+        for i in range(n_layers):
+            named_shapes[f"backbone.layers.{i}.mixer.q_proj"] = (4096, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.k_proj"] = (1024, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.v_proj"] = (1024, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.in_proj"] = (10304, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.out_proj"] = (2688, 4096)
+            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.up_proj"] = (3712, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.shared_experts.down_proj"] = (2688, 3712)
+        for i in range(n_layers):
+            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc1"] = (128, 1856, 2688)
+            named_shapes[f"backbone.layers.{i}.mixer.switch_mlp.fc2"] = (128, 2688, 1856)
+        sensitivity = {str(i): 0.1 / (i + 1) for i in range(n_layers)}
+        config = {
+            "num_hidden_layers": n_layers,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": sensitivity,
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2, target_bpw=2.8, hard_cap_bpw=3.0
+        )
+        assert plan.effective_bpw >= 2.7, (
+            f"Expected bpw >= 2.7, got {plan.effective_bpw:.2f}"
+        )
+        assert plan.effective_bpw <= 3.0
+        # Attention should be boosted via protection floor
+        attn_boosts = [k for k in plan.boost_map if "q_proj" in k or "v_proj" in k]
+        assert len(attn_boosts) > 0, "Expected attention protection floor boosts"
+        # switch_mlp experts should NOT be boosted
+        expert_boosts = [k for k in plan.boost_map if "switch_mlp" in k]
+        assert len(expert_boosts) == 0, "Routed experts should stay at base bits"
+
+
+# =============================================================================
+# Test GPTQ quantization

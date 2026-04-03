@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens
+from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
@@ -161,6 +161,8 @@ class VLMBatchedEngine(BaseEngine):
         self._adapter = None
         self._engine = None
         self._loaded = False
+        self._grammar_compiler = None
+        self._grammar_compiler_init_attempted = False
 
     @property
     def model_name(self) -> str:
@@ -181,6 +183,41 @@ class VLMBatchedEngine(BaseEngine):
     @property
     def is_ocr_model(self) -> bool:
         return (self.model_type or "") in OCR_MODEL_TYPES
+
+    @property
+    def grammar_compiler(self):
+        """Lazily create and return a GrammarCompiler for this VLM model."""
+        if self._grammar_compiler is not None:
+            return self._grammar_compiler
+        if self._grammar_compiler_init_attempted:
+            return None
+        self._grammar_compiler_init_attempted = True
+        try:
+            from ..api.grammar import create_grammar_compiler
+
+            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._vlm_model)
+            logger.info("GrammarCompiler initialized for %s", self._model_name)
+        except Exception:
+            from ..utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                logger.info(
+                    "Structured output is not available in the DMG version "
+                    "(xgrammar requires torch which significantly increases app size). "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
+        return self._grammar_compiler
 
     def _resolve_ocr_stop_token_ids(self) -> list[int]:
         """Convert OCR stop sequences to token IDs via the tokenizer.
@@ -265,6 +302,16 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # TurboQuant KV cache
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -492,6 +539,8 @@ class VLMBatchedEngine(BaseEngine):
                 return_messages=True,
             )
 
+        # Strip partial field from messages (VLM always uses add_generation_prompt=True)
+        detect_and_strip_partial(formatted_messages)
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -522,6 +571,26 @@ class VLMBatchedEngine(BaseEngine):
             prompt = template_target.apply_chat_template(
                 formatted_messages, **template_kwargs
             )
+        except ValueError:
+            # Processor has apply_chat_template but no chat_template set
+            # (e.g. mlx-vlm custom processor without processor_config.json).
+            # Fall back to processor.tokenizer which holds the actual template.
+            fallback = getattr(self._processor, "tokenizer", None)
+            if fallback is not None and fallback is not template_target:
+                try:
+                    prompt = fallback.apply_chat_template(
+                        formatted_messages, **template_kwargs
+                    )
+                except TypeError:
+                    if chat_template_kwargs:
+                        for key in chat_template_kwargs:
+                            template_kwargs.pop(key, None)
+                    template_kwargs.pop("enable_thinking", None)
+                    prompt = fallback.apply_chat_template(
+                        formatted_messages, **template_kwargs
+                    )
+            else:
+                raise
 
         # Tokenize text and preprocess images
         inputs = prepare_inputs(
@@ -580,6 +649,8 @@ class VLMBatchedEngine(BaseEngine):
     ) -> str:
         """Apply chat template for text-only messages (no images)."""
         if hasattr(self._tokenizer, "apply_chat_template"):
+            # Strip partial field (VLM always uses add_generation_prompt=True)
+            detect_and_strip_partial(messages)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -640,11 +711,14 @@ class VLMBatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         output = await self._engine.generate(
@@ -702,11 +776,14 @@ class VLMBatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -965,6 +1042,16 @@ class VLMBatchedEngine(BaseEngine):
             text_messages, template_tools, chat_template_kwargs=chat_template_kwargs
         )
         return len(self._tokenizer.encode(prompt))
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        engine_core = getattr(self, "_engine", None)
+        if engine_core is not None:
+            inner = getattr(engine_core, "engine", None)
+            if inner is not None:
+                collectors = getattr(inner, "_output_collectors", {})
+                return len(collectors) > 0
+        return False
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

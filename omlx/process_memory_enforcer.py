@@ -115,26 +115,18 @@ class ProcessMemoryEnforcer:
         return max(get_system_memory() - 4 * 1024**3, self._max_bytes)
 
     def _set_metal_memory_limit(self) -> None:
-        """Set Metal-level memory limit as a safety net.
+        """No-op. Metal-level limits removed to prevent model load swap.
 
-        Even if advisory in current MLX versions, this encourages more
-        aggressive cache reclamation and may become strict in the future.
-        Only applied when prefill_memory_guard is enabled.
+        mx.set_memory_limit() causes MLX to aggressively reclaim cached
+        buffers during model loading, creating alloc/free churn that
+        pushes the system into swap. All memory enforcement is handled
+        by mx.get_active_memory() polling instead. (#429)
         """
-        if not self._prefill_memory_guard:
-            return
-        hard_limit = self._get_hard_limit_bytes()
-        if hard_limit <= 0:
-            return
-        try:
-            mx.set_memory_limit(hard_limit)
-            mx.set_cache_limit(hard_limit // 2)
-            logger.info(
-                f"Metal memory limit set: {_format_gb(hard_limit)}, "
-                f"cache limit: {_format_gb(hard_limit // 2)}"
-            )
-        except Exception as e:
-            logger.debug(f"Failed to set Metal memory limit: {e}")
+        pass
+
+    def _clear_metal_memory_limit(self) -> None:
+        """No-op. See _set_metal_memory_limit."""
+        pass
 
     @property
     def prefill_memory_guard(self) -> bool:
@@ -148,6 +140,8 @@ class ProcessMemoryEnforcer:
             self._propagate_memory_limit()
             if value:
                 self._set_metal_memory_limit()
+            else:
+                self._clear_metal_memory_limit()
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
 
     def _propagate_memory_limit(self) -> None:

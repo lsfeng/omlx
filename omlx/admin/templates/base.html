@@ -44,6 +44,13 @@
     </script>
 
     <style>
+        /* Lucide icon fallback: ensure unprocessed <i data-lucide> elements
+           are inline-block so Tailwind w-*/h-* classes apply even if
+           lucide.min.js fails to load or createIcons() hasn't run yet. */
+        [data-lucide] {
+            display: inline-block;
+        }
+
         /* Language-specific font stack */
         :root {
             {% if current_lang == 'ko' %}
@@ -112,30 +119,44 @@
     {% block content %}{% endblock %}
 
     <script>
-        // Debug: Check Lucide loading
-        console.log('[Debug] Lucide loaded:', typeof lucide, lucide);
+        // Lucide icon processor — bypasses createIcons() which has Safari issues.
+        // Directly creates SVGs from lucide.icons definitions.
+        (function() {
+            if (typeof lucide === 'undefined' || !lucide.icons) return;
 
-        document.addEventListener('DOMContentLoaded', () => {
-            console.log('[Debug] DOMContentLoaded - icons found:', document.querySelectorAll('[data-lucide]').length);
-            console.log('[Debug] Calling lucide.createIcons()');
-            lucide.createIcons();
-            console.log('[Debug] After createIcons - icons remaining:', document.querySelectorAll('[data-lucide]').length);
-            console.log('[Debug] SVGs created:', document.querySelectorAll('svg.lucide').length);
-        });
+            function toPascal(s) {
+                return s.replace(/(^|[-_ ])(\w)/g, function(m, sep, c) { return c.toUpperCase(); });
+            }
 
-        document.addEventListener('alpine:initialized', () => {
-            console.log('[Debug] alpine:initialized');
-            setTimeout(() => {
-                console.log('[Debug] setTimeout after alpine:initialized - icons found:', document.querySelectorAll('[data-lucide]').length);
-                lucide.createIcons();
-                console.log('[Debug] After createIcons - SVGs:', document.querySelectorAll('svg.lucide').length);
-            }, 0);
-        });
+            function replaceIcon(el) {
+                var name = el.getAttribute('data-lucide');
+                if (!name) return;
+                var def = lucide.icons[toPascal(name)];
+                if (!def) return;
+                var svg = lucide.createElement(def);
+                Array.from(el.attributes).forEach(function(a) {
+                    if (a.name !== 'data-lucide') svg.setAttribute(a.name, a.value);
+                });
+                svg.classList.add('lucide', 'lucide-' + name);
+                if (el.parentNode) el.parentNode.replaceChild(svg, el);
+            }
 
-        window.addEventListener('load', () => {
-            console.log('[Debug] window.load');
-            lucide.createIcons();
-        });
+            function processAll() {
+                document.querySelectorAll('i[data-lucide]').forEach(replaceIcon);
+            }
+
+            // Initial pass
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', processAll);
+            } else {
+                processAll();
+            }
+
+            // Poll for dynamically added icons (Alpine x-for, x-if, modals).
+            setInterval(function() {
+                if (document.querySelector('i[data-lucide]')) processAll();
+            }, 300);
+        })();
     </script>
 
     {% block scripts %}{% endblock %}

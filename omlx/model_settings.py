@@ -55,6 +55,11 @@ class ModelSettings:
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
+    reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+
+    # TurboQuant KV cache (mlx-vlm backend)
+    turboquant_kv_enabled: bool = False
+    turboquant_kv_bits: float = 4  # integer (3, 4) or fractional (3.5)
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False

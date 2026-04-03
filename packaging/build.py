@@ -229,29 +229,72 @@ def _wheel_pkg_name(whl_path: Path) -> str:
     return whl_path.stem.split("-")[0].replace("_", "-").lower()
 
 
+
+def _find_target_python() -> str:
+    """Find a Python interpreter matching the venvstacks target version.
+
+    Sdist-only packages may compile C extensions, so the wheel must be built
+    with the same Python version that venvstacks targets (e.g. 3.11).
+    Falls back to sys.executable if no matching version is found.
+    """
+    toml_path = SCRIPT_DIR / "venvstacks.toml"
+    content = toml_path.read_text()
+    match = re.search(r'python_implementation\s*=\s*"cpython@(\d+\.\d+)', content)
+    if not match:
+        return sys.executable
+
+    target_minor = match.group(1)  # e.g. "3.11"
+    candidates = [
+        shutil.which(f"python{target_minor}"),
+        str(BUILD_DIR / f"cpython-{target_minor}" / "bin" / f"python{target_minor}"),
+    ]
+    for path in candidates:
+        if path and Path(path).exists():
+            return path
+
+    print(f"  Warning: python{target_minor} not found, using {sys.executable}")
+    return sys.executable
+
+
+def _build_sdist_wheel(pkg_name: str) -> bool:
+    """Build a wheel for a sdist-only package into _wheels/.
+
+    Uses the target Python version so C extensions get the correct ABI tag.
+    Returns True if the wheel was built successfully.
+    """
+    target_python = _find_target_python()
+    print(f"  Building wheel for {pkg_name} (sdist-only, using {target_python})...")
+    result = subprocess.run(
+        [target_python, "-m", "pip", "wheel", pkg_name, "--no-deps",
+         "-w", str(WHEELS_DIR)],
+        capture_output=False,
+    )
+    return result.returncode == 0
+
+
 def build_local_wheels():
     """Pre-build wheels for git-pinned packages.
 
-    venvstacks/uv disables source builds, so git-pinned packages must be
-    pre-built as wheels. This function:
+    venvstacks/uv disables source builds (--only-binary :all:), so git-pinned
+    packages must be pre-built as wheels. This function:
     1. Parses git URLs from venvstacks.toml
     2. Builds wheels via pip
     3. Returns a mapping of package_name -> version for toml rewriting
+
+    Sdist-only dependencies (packages with no pre-built wheel on PyPI) are
+    handled separately by _lock_with_sdist_retry() during the lock step.
     """
-    print("\n[0/4] Building wheels for git packages...")
+    print("\n[0/4] Building local wheels...")
 
     toml_path = SCRIPT_DIR / "venvstacks.toml"
     git_reqs = _parse_git_requirements(toml_path)
-
-    if not git_reqs:
-        print("  No git requirements found, skipping.")
-        return {}
 
     # Clean and recreate wheels dir for fresh builds
     if WHEELS_DIR.exists():
         shutil.rmtree(WHEELS_DIR)
     WHEELS_DIR.mkdir(parents=True)
 
+    # Build wheels from git-pinned packages
     for full_req, git_url in git_reqs:
         pkg_name = full_req.split("@")[0].strip()
         print(f"  Building wheel for {pkg_name} ...")
@@ -262,16 +305,78 @@ def build_local_wheels():
             "-w", str(WHEELS_DIR),
         ])
 
-    # Build version mapping from built wheels
+    # Build version mapping from git-pinned wheels only
+    # (used for rewriting venvstacks.toml git URLs to local file:// paths)
+    git_pkg_names = {
+        full_req.split("@")[0].strip().lower().replace("-", "_")
+        for full_req, _ in git_reqs
+    }
     version_map = {}
     for whl in WHEELS_DIR.glob("*.whl"):
         name = _wheel_pkg_name(whl)
         version = _wheel_version(whl)
-        version_map[name] = version
+        if name.replace("-", "_") in git_pkg_names:
+            version_map[name] = version
         print(f"    {name} == {version}")
 
-    print(f"  ✓ {len(version_map)} wheel(s) built in {WHEELS_DIR}")
+    total = len(list(WHEELS_DIR.glob("*.whl")))
+    print(f"  ✓ {total} wheel(s) built in {WHEELS_DIR}")
     return version_map
+
+
+def _lock_with_sdist_retry(lock_cmd: list, max_retries: int = 10):
+    """Run venvstacks lock, auto-building wheels for sdist-only packages.
+
+    When uv fails with "has no usable wheels", extract the package name,
+    build a wheel locally into _wheels/, and retry. Repeats up to
+    max_retries times to handle transitive sdist-only dependencies.
+    """
+    built = set()
+    for attempt in range(max_retries):
+        result = subprocess.run(
+            lock_cmd, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            if result.stdout:
+                print(result.stdout, end="")
+            return
+
+        stderr = result.stderr or ""
+        stdout = result.stdout or ""
+        combined = stderr + stdout
+
+        # Pattern: "Because <pkg>==<ver> has no usable wheels"
+        match = re.search(
+            r"Because\s+(\S+)==\S+\s+has no usable wheels", combined
+        )
+        if not match:
+            # Not a sdist-only failure — print output and abort
+            if stdout:
+                print(stdout, end="")
+            if stderr:
+                print(stderr, end="", file=sys.stderr)
+            print(f"  ✗ Command failed with code {result.returncode}")
+            sys.exit(1)
+
+        pkg = match.group(1)
+        if pkg in built:
+            # Already tried this package, something else is wrong
+            if stdout:
+                print(stdout, end="")
+            if stderr:
+                print(stderr, end="", file=sys.stderr)
+            print(f"  ✗ Already built {pkg} but lock still fails")
+            sys.exit(1)
+
+        print(f"  sdist-only dependency detected: {pkg}, building wheel...")
+        if not _build_sdist_wheel(pkg):
+            print(f"  ✗ Failed to build wheel for {pkg}")
+            sys.exit(1)
+        built.add(pkg)
+        print(f"  Retrying lock (attempt {attempt + 2})...")
+
+    print(f"  ✗ Lock still failing after {max_retries} sdist wheel builds")
+    sys.exit(1)
 
 
 def _find_wheel_for_package(pkg_name: str) -> Path | None:
@@ -400,6 +505,8 @@ def build_venvstacks():
         local_wheels_args = ["--local-wheels", str(WHEELS_DIR)]
 
     # Step 3: Lock environments (always re-lock to match current wheels)
+    # If lock fails due to sdist-only packages (no pre-built wheel on PyPI),
+    # _lock_with_sdist_retry() builds them locally and retries automatically.
     print("\n  Locking environments...")
     lock_cmd = [
         "pipx", "run", "venvstacks", "lock",
@@ -410,7 +517,7 @@ def build_venvstacks():
         lock_cmd += ["--reset-lock", "*"]
     else:
         lock_cmd += ["--if-needed"]
-    run_cmd(lock_cmd)
+    _lock_with_sdist_retry(lock_cmd)
 
     # Step 4: Build environments
     print("\n  Building environments (this may take a while)...")
@@ -435,7 +542,110 @@ def build_venvstacks():
     if version_map and resolved_toml.exists():
         resolved_toml.unlink()
 
+    # Install mlx-audio separately: build wheel from git, install --no-deps.
+    # mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm,
+    # so it can't go through venvstacks' uv resolver.
+    _install_mlx_audio(EXPORT_DIR)
+
+    # Strip large packages that are only needed for model conversion / data
+    # loading, not inference. Saves ~780 MB in the app bundle.
+    _strip_unused_packages(EXPORT_DIR)
+
     return EXPORT_DIR
+
+
+# mlx-audio git commit — aligned with pyproject.toml [audio] extra
+_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@6408d2a410eb8c57464e07725b92271860199250"
+
+
+def _install_mlx_audio(export_dir: Path):
+    """Build mlx-audio wheel from git and install into exported framework."""
+    print("\n  Building mlx-audio from git...")
+    audio_wheels = SCRIPT_DIR / "_audio_wheels"
+    if audio_wheels.exists():
+        shutil.rmtree(audio_wheels)
+    audio_wheels.mkdir()
+
+    # Build wheel
+    run_cmd([
+        sys.executable, "-m", "pip", "wheel",
+        "--no-deps", "--wheel-dir", str(audio_wheels),
+        _MLX_AUDIO_GIT,
+    ])
+
+    # Install into framework site-packages
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        print(f"  ✗ site-packages not found: {fw_site}")
+        return
+
+    import zipfile
+    for whl in audio_wheels.glob("*.whl"):
+        print(f"    Installing {whl.name} (--no-deps)")
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(fw_site)
+
+    shutil.rmtree(audio_wheels)
+    print("  ✓ mlx-audio installed")
+
+
+# Packages to strip from the app bundle. These are transitive dependencies
+# pulled in by modelscope (datasets→pyarrow/pandas) and mlx-vlm (opencv)
+# but are NOT needed for inference at runtime. torch/sympy kept as safety
+# net in case any future dependency pulls them in transitively.
+_STRIP_PACKAGES = [
+    "torch",
+    "sympy",           # torch dep (safety net)
+    "cv2",             # opencv-python, mlx-vlm only uses it for image loading (Pillow suffices)
+    "pyarrow",         # datasets dep
+    "pandas",          # datasets dep
+    "datasets",        # modelscope dep, not used at inference
+    # dist-info dirs (matched by prefix)
+]
+
+# Prefixes for dist-info directories to remove alongside the packages above.
+_STRIP_DIST_PREFIXES = [
+    "torch-", "sympy-", "opencv_python-", "pyarrow-", "pandas-", "datasets-",
+]
+
+
+def _strip_unused_packages(export_dir: Path):
+    """Remove large packages not needed for inference from exported framework."""
+    fw_site = (
+        export_dir
+        / "framework-mlx-framework"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        return
+
+    print("\n  Stripping unused packages from app bundle...")
+    saved = 0
+
+    for item in sorted(fw_site.iterdir()):
+        name = item.name
+        should_strip = (
+            name in _STRIP_PACKAGES
+            or any(name.startswith(p) for p in _STRIP_DIST_PREFIXES)
+        )
+        if should_strip and item.exists():
+            size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            saved += size
+            print(f"    Removed {name} ({size / 1024 / 1024:.0f} MB)")
+
+    print(f"  ✓ Stripped {saved / 1024 / 1024:.0f} MB total")
 
 
 def _create_c_launcher(macos_dir: Path, app_name: str):

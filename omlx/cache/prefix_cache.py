@@ -98,7 +98,7 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Hash table for quick prefix lookup
         # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
-        self._prefix_index: Dict[bytes, Tuple[int, List[int], int]] = {}
+        self._prefix_index: Dict[bytes, Tuple[int, Tuple[int, ...], int]] = {}
 
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
@@ -361,7 +361,11 @@ class BlockAwarePrefixCache(CacheManager):
         elif is_tensor_data:
             # Try to extract type info from cache_data itself
             layer_cache_types = [
-                layer_state.get('cache_type', 'KVCache')
+                # Prefer class_name for TurboQuant (cache_type maps to 'KVCache'),
+                # fall back to cache_type for all standard mlx-lm types.
+                layer_state.get('class_name', layer_state.get('cache_type', 'KVCache'))
+                if layer_state.get('class_name', '') in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
+                else layer_state.get('cache_type', 'KVCache')
                 for layer_state in cache_data
             ]
             layer_meta_states = [
@@ -606,7 +610,22 @@ class BlockAwarePrefixCache(CacheManager):
                 if cache_type in non_sliceable_types or class_name in non_sliceable_types:
                     continue
 
-                keys, _ = layer_state['state']
+                state = layer_state['state']
+                keys = state[0] if isinstance(state, (list, tuple)) else state
+                # TurboQuant v2: NamedTuple state with .norms attribute
+                if hasattr(keys, 'norms') and hasattr(keys.norms, 'shape'):
+                    seq_len = keys.norms.shape[2]
+                    logger.debug(
+                        f"Found TurboQuantKVCache at layer {layer_idx} with seq_len={seq_len}"
+                    )
+                    return seq_len
+                # TurboQuant v2: SplitState with .low/.high sub-states
+                if hasattr(keys, 'low') and hasattr(keys.low, 'norms'):
+                    seq_len = keys.low.norms.shape[2]
+                    logger.debug(
+                        f"Found TurboQuantKVCache (split) at layer {layer_idx} with seq_len={seq_len}"
+                    )
+                    return seq_len
                 if not hasattr(keys, 'shape'):
                     continue
 
@@ -723,7 +742,31 @@ class BlockAwarePrefixCache(CacheManager):
 
                 handler = CacheTypeRegistry.get_handler_by_class_name(cache_type_name)
 
-                if handler.supports_block_slicing:
+                if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
+                    # TurboQuant v2: NamedTuple state from mlx-vlm
+                    from ..turboquant_kv import _slice_state_range, _state_length
+                    state = layer_state['state']
+                    if not isinstance(state, (list, tuple)) or len(state) < 2:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    k_state, v_state = state[0], state[1]
+                    # Unwrap _QuantizedStateProxy if present
+                    if hasattr(k_state, '_state'):
+                        k_state = k_state._state
+                    if hasattr(v_state, '_state'):
+                        v_state = v_state._state
+                    seq_len = _state_length(k_state)
+                    actual_end = min(end_idx, seq_len)
+                    if start_idx >= actual_end:
+                        block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
+                        continue
+                    ks = _slice_state_range(k_state, start_idx, actual_end)
+                    vs = _slice_state_range(v_state, start_idx, actual_end)
+                    block_slices.append((
+                        '__turboquant_v2__',
+                        (ks, vs),
+                    ))
+                elif handler.supports_block_slicing:
                     # Standard 4D KV cache slicing
                     state = layer_state['state']
                     if not isinstance(state, (list, tuple)) or len(state) < 2:
@@ -1457,6 +1500,59 @@ class BlockAwarePrefixCache(CacheManager):
                     reconstructed_caches.append(cache)
                     continue
 
+                # === TurboQuantKVCache: concat NamedTuple states, reconstruct ===
+                if cache_type_name in ('TurboQuantKVCache', 'BatchTurboQuantKVCache'):
+                    from ..turboquant_kv import _concat_state, _state_length
+                    key_states, value_states = [], []
+                    for block_data in all_block_data:
+                        if layer_idx >= len(block_data):
+                            continue
+                        bd = block_data[layer_idx]
+                        if isinstance(bd, tuple) and len(bd) == 2:
+                            if isinstance(bd[0], str) and bd[0] == '__turboquant_v2__':
+                                ks, vs = bd[1]
+                            else:
+                                ks, vs = bd
+                            key_states.append(ks)
+                            value_states.append(vs)
+                    if not key_states:
+                        logger.debug(f"TQ layer {layer_idx}: no block data")
+                        return None
+                    # Concatenate along token dimension
+                    cat_ks = key_states[0]
+                    for s in key_states[1:]:
+                        cat_ks = _concat_state(cat_ks, s)
+                    cat_vs = value_states[0]
+                    for s in value_states[1:]:
+                        cat_vs = _concat_state(cat_vs, s)
+                    try:
+                        from mlx_vlm.turboquant import TurboQuantKVCache
+                        from mlx_lm.models.cache import KVCache
+                        tq_bits = 4.0
+                        tq_seed = 0
+                        ms = None
+                        if first_block_meta_states and layer_idx < len(first_block_meta_states):
+                            ms = first_block_meta_states[layer_idx]
+                        if isinstance(ms, (list, tuple)) and len(ms) >= 3:
+                            tq_bits = float(ms[1])
+                            tq_seed = int(ms[2])
+                        # Dequantize back to fp16 KVCache for merge compatibility.
+                        # TQ will be re-applied at decode start (lazy quantization).
+                        tq = TurboQuantKVCache(bits=tq_bits, seed=tq_seed)
+                        tq.keys = cat_ks
+                        tq.values = cat_vs
+                        tq.offset = _state_length(cat_ks)
+                        keys, values = tq.dequantize()
+                        cache = KVCache()
+                        cache.keys = keys
+                        cache.values = values
+                        cache.offset = keys.shape[2]
+                        reconstructed_caches.append(cache)
+                    except Exception as e:
+                        logger.error(f"TQ layer {layer_idx}: reconstruction failed: {e}")
+                        return None
+                    continue
+
                 # Collect layer data from all blocks
                 layer_states = []
                 for block_data in all_block_data:
@@ -1570,6 +1666,31 @@ class BlockAwarePrefixCache(CacheManager):
                     f"layers, expected {num_layers}"
                 )
                 return None
+
+            # Verify KVCache offset consistency across KVCache-typed layers.
+            # All KVCache layers must have the same offset (they process
+            # the same tokens). A mismatch causes broadcast_shapes errors
+            # when the model creates a single attention mask from one layer
+            # and applies it to all attention layers.
+            # NOTE: only check layers explicitly typed as 'KVCache'.
+            # RotatingKVCache also has 'offset' but its meaning differs
+            # (total tokens ever processed, not buffer size), so mixing
+            # them would produce false positives.
+            if layer_cache_types:
+                kv_offsets = set()
+                for idx, c in enumerate(reconstructed_caches):
+                    if (idx < len(layer_cache_types)
+                            and layer_cache_types[idx] == 'KVCache'
+                            and hasattr(c, 'offset')
+                            and isinstance(getattr(c, 'offset', None), int)):
+                        kv_offsets.add(c.offset)
+                if len(kv_offsets) > 1:
+                    logger.warning(
+                        f"KVCache offset inconsistency after reconstruction: "
+                        f"{kv_offsets}. Rejecting cache to prevent "
+                        f"broadcast_shapes errors."
+                    )
+                    return None
 
             logger.debug(
                 f"Reconstructed cache from tiered cache: {len(reconstructed_caches)} layers, "
@@ -1848,7 +1969,7 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         tokens: List[int],
         extra_keys: Optional[Tuple[Any, ...]] = None,
-    ) -> Optional[Tuple[int, List[int], int]]:
+    ) -> Optional[Tuple[int, Tuple[int, ...], int]]:
         """Find best matching prefix in the index."""
         best_match = None
         best_len = 0
@@ -1911,7 +2032,7 @@ class BlockAwarePrefixCache(CacheManager):
 
             parent_hash = block_hash
             prefix_len += len(block_tokens)
-            self._prefix_index[block_hash] = (prefix_len, block_ids, i + 1)
+            self._prefix_index[block_hash] = (prefix_len, tuple(block_ids[: i + 1]), i + 1)
 
     def get_stats(self) -> PrefixCacheStats:
         """

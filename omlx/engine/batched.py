@@ -12,11 +12,12 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_special_tokens
+from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
 
 # Optional Harmony adapter import
 try:
@@ -67,6 +68,8 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._engine = None
         self._loaded = False
+        self._grammar_compiler = None
+        self._grammar_compiler_init_attempted = False
 
     @property
     def model_name(self) -> str:
@@ -101,6 +104,44 @@ class BatchedEngine(BaseEngine):
         except Exception as e:
             logger.debug(f"Error getting model_type: {e}")
         return None
+
+    @property
+    def grammar_compiler(self):
+        """Lazily create and return a GrammarCompiler for this model.
+
+        Returns ``None`` when xgrammar is not installed or initialization fails.
+        """
+        if self._grammar_compiler is not None:
+            return self._grammar_compiler
+        if self._grammar_compiler_init_attempted:
+            return None
+        self._grammar_compiler_init_attempted = True
+        try:
+            from ..api.grammar import create_grammar_compiler
+
+            self._grammar_compiler = create_grammar_compiler(self._tokenizer, self._model)
+            logger.info("GrammarCompiler initialized for %s", self._model_name)
+        except Exception:
+            from ..utils.install import get_install_method
+
+            method = get_install_method()
+            if method == "dmg":
+                logger.info(
+                    "Structured output is not available in the DMG version "
+                    "(xgrammar requires torch which significantly increases app size). "
+                    "Use the pip or Homebrew version for structured output support."
+                )
+            elif method == "homebrew":
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Reinstall with: brew reinstall omlx --with-grammar"
+                )
+            else:
+                logger.info(
+                    "Structured output requires xgrammar. "
+                    "Install with: pip install 'omlx[grammar]'"
+                )
+        return self._grammar_compiler
 
     def _preprocess_messages(
         self, messages: list[dict[str, Any]]
@@ -160,6 +201,15 @@ class BatchedEngine(BaseEngine):
             self._model, self._model_settings
         )
 
+        # TurboQuant KV cache: patch attention and set kv_bits on scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                from ..patches.turboquant_attention import apply_turboquant_attention_patch
+                apply_turboquant_attention_patch()
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
         scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
@@ -177,6 +227,13 @@ class BatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        # TurboQuant KV cache: propagate bits to scheduler
+        if self._model_settings is not None:
+            tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
+            if tq_enabled:
+                tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
+                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -224,10 +281,13 @@ class BatchedEngine(BaseEngine):
                 (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
         """
         if hasattr(self._tokenizer, 'apply_chat_template'):
+            is_partial = detect_and_strip_partial(messages)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": True,
+                "add_generation_prompt": not is_partial,
             }
+            if is_partial:
+                template_kwargs["continue_final_message"] = True
             if tools:
                 template_kwargs["tools"] = tools
             # Global fallback
@@ -322,11 +382,14 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         output = await self._engine.generate(
@@ -387,11 +450,14 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -400,6 +466,8 @@ class BatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
             specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_threshold") is not None:
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
@@ -576,6 +644,16 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        engine_core = getattr(self, "_engine", None)
+        if engine_core is not None:
+            inner = getattr(engine_core, "engine", None)
+            if inner is not None:
+                collectors = getattr(inner, "_output_collectors", {})
+                return len(collectors) > 0
+        return False
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
